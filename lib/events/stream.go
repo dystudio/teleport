@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -97,6 +98,10 @@ type Stream struct {
 	uploadContext context.Context
 
 	uploadCancel context.CancelFunc
+
+	// waitCh is used to unblock when the upload completes and return
+	// the error (or nil).
+	waitCh chan error
 }
 
 func NewStreamManger(ctx context.Context) *StreamManager {
@@ -130,6 +135,7 @@ func (s *StreamManager) NewStream(serverID string, uploader SessionUploader) (*S
 		serverID:      serverID,
 		uploadContext: ctx,
 		uploadCancel:  cancel,
+		waitCh:        make(chan error),
 	}, nil
 }
 
@@ -151,13 +157,25 @@ func (s *StreamManager) releaseSemaphore() error {
 	}
 }
 
+func (s *Stream) Wait() error {
+	return <-s.waitCh
+}
+
+func (s *Stream) GetState() int64 {
+	return atomic.LoadInt64(&s.state)
+}
+
+func (s *Stream) setState(state int64) {
+	atomic.StoreInt64(&s.state, state)
+}
+
 func (s *Stream) Process(chunk *proto.SessionChunk) error {
 	// Check that the state transitions are sane.
 	err := s.checkTransition(chunk)
 	if err != nil {
+		fmt.Printf("--> INVALID STATE.\n")
 		return trace.Wrap(err)
 	}
-	// TODO: Is it safe to transition the state without knowing if it was successful?
 	s.setState(chunk.GetState())
 
 	switch chunk.GetState() {
@@ -173,7 +191,6 @@ func (s *Stream) Process(chunk *proto.SessionChunk) error {
 		// Kick off the upload in a goroutine so it can be uploaded as it
 		// is processed.
 		go s.upload(chunk.GetNamespace(), session.ID(chunk.GetSessionID()), pr)
-
 	case stateComplete:
 		s.manager.log.Debugf("Changing state to COMPLETE for stream %v.", s.sessionID)
 
@@ -198,6 +215,12 @@ func (s *Stream) Process(chunk *proto.SessionChunk) error {
 	default:
 		err = trace.BadParameter("unknown event type %v", chunk.GetState())
 	}
+
+	// If any error occurs during processing, cancel the upload.
+	if err != nil {
+		s.uploadCancel()
+	}
+
 	return nil
 }
 
@@ -305,16 +328,40 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 	return nil
 }
 
-func (s *Stream) GetState() int64 {
-	return atomic.LoadInt64(&s.state)
-}
-
-func (s *Stream) setState(state int64) {
-	atomic.StoreInt64(&s.state, state)
-}
-
+// checkTransition makes sure the archive is being created in a sane manner.
 func (s *Stream) checkTransition(chunk *proto.SessionChunk) error {
-	return nil
+	prev := s.GetState()
+
+	switch chunk.GetState() {
+	case stateInit:
+		return nil
+	case stateOpenRaw, stateOpenEvents:
+		if prev == stateInit || prev == stateCloseRaw || prev == stateCloseEvents {
+			return nil
+		}
+	case stateChunkRaw:
+		if prev == stateChunkRaw || prev == stateOpenRaw {
+			return nil
+		}
+	case stateCloseRaw:
+		if prev == stateChunkRaw {
+			return nil
+		}
+	case stateChunkEvents:
+		if prev == stateChunkEvents || prev == stateOpenEvents {
+			return nil
+		}
+	case stateCloseEvents:
+		if prev == stateChunkEvents {
+			return nil
+		}
+	case stateComplete:
+		if prev == stateCloseRaw || prev == stateCloseEvents {
+			return nil
+		}
+	}
+
+	return trace.BadParameter("invalid chunk transition from %v to %v", prev, chunk.GetState())
 }
 
 func (s *Stream) Reader() io.Reader {
@@ -322,7 +369,7 @@ func (s *Stream) Reader() io.Reader {
 }
 
 func (s *Stream) Close() error {
-	//s.closeCancel()
+	s.uploadCancel()
 	return nil
 }
 
@@ -337,7 +384,9 @@ func (s *Stream) upload(namespace string, sessionID session.ID, reader io.Reader
 	})
 	if err != nil {
 		s.manager.log.Warnf("Failed to upload session recording: %v.", err)
+		s.waitCh <- trace.Wrap(err)
 	}
+	s.waitCh <- nil
 }
 
 func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) error {

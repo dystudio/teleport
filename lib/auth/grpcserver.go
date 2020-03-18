@@ -231,6 +231,13 @@ func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessi
 
 	}
 
+	// Wait for the upload to finish in-case an error occurs uploading the
+	// last chunk.
+	err = sb.Wait()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
 	return nil
 }
 
