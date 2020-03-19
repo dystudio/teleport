@@ -1039,34 +1039,3 @@ func (l *AuditLog) periodicSpaceMonitor() {
 		}
 	}
 }
-
-// removeFiles will remove session recordings matching a passed in prefix
-// within the scan dir. Used by both the node (to remove recordings after
-// successfully uploading them) and by auth to remove recordings if the
-// upload context has been canceled.
-func removeFiles(scanDir string, sessionID session.ID) error {
-	df, err := os.Open(scanDir)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	defer df.Close()
-	entries, err := df.Readdir(-1)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	for i := range entries {
-		fi := entries[i]
-		if fi.IsDir() {
-			continue
-		}
-		if !strings.HasPrefix(fi.Name(), string(sessionID)) {
-			continue
-		}
-		path := filepath.Join(scanDir, fi.Name())
-		if err := os.Remove(path); err != nil {
-			log.Warningf("Failed to remove %v: %v.", path, trace.DebugReport(err))
-		}
-		log.Debugf("Removed %v.", path)
-	}
-	return nil
-}
