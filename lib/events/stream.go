@@ -118,6 +118,10 @@ type Stream struct {
 // NewStreamManger is used to manage common stream resources like a pool of
 // buffers and a semaphore.
 func NewStreamManger(ctx context.Context) *StreamManager {
+	// If no context is passed in (like in tests) then set a background context.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &StreamManager{
 		log: logrus.WithFields(logrus.Fields{
 			trace.Component: "stream",
@@ -428,7 +432,7 @@ func (s *Stream) upload(namespace string, sessionID session.ID, reader io.Reader
 	})
 	if err != nil {
 		s.manager.log.Warnf("Failed to upload session recording: %v.", err)
-		s.Close(trace.Wrap(err))
+		return
 	}
 
 	// The upload is complete, write nil to unblock.
