@@ -189,7 +189,7 @@ func (g *GRPCServer) GetUsers(req *proto.GetUsersRequest, stream proto.AuthServi
 	return nil
 }
 
-func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessionRecordingServer) (er error) {
+func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessionRecordingServer) error {
 	auth, err := g.authenticate(stream.Context())
 	if err != nil {
 		return trail.ToGRPC(err)
@@ -202,16 +202,15 @@ func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessi
 	}
 
 	// Create a new stream and process events in a non-blocking manner.
-	sb, err := g.manager.NewStream(serverID, auth, stream)
+	sb, err := g.manager.ProcessStream(serverID, auth, stream)
 	if err != nil {
 		return trail.ToGRPC(err)
 	}
-	defer sb.Close(trace.Wrap(er))
 
-	// Wait will block until the stream is complete or an error occurs.
+	// Block until processing of the stream is complete.
 	err = sb.Wait()
 	if err != nil {
-		return trace.Wrap(err)
+		return trail.ToGRPC(err)
 	}
 
 	return nil

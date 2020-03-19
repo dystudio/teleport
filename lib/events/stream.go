@@ -22,11 +22,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
-	//"sync/atomic"
 
 	"github.com/gravitational/teleport/lib/auth/proto"
 	"github.com/gravitational/teleport/lib/session"
@@ -66,7 +64,6 @@ type StreamManager struct {
 	// pool is used to store a pool of buffers used to build in-memory gzip files.
 	pool sync.Pool
 
-	// TODO: Remove?
 	// semaphore is used to limit the number of in-memory gzip files.
 	semaphore chan struct{}
 
@@ -75,11 +72,17 @@ type StreamManager struct {
 	closeContext context.Context
 }
 
+// Stream pulls and processes events off the GRPC stream.
 type Stream struct {
-	manager   *StreamManager
-	chunkType int64
-	uploader  SessionUploader
+	manager *StreamManager
 
+	// chunkType is the last type of chunk that was processed by the stream.
+	chunkType int64
+
+	// uploader implements UploadSessionRecording on the Auth Server.
+	uploader SessionUploader
+
+	// stream is the GRPC stream off of which events are consumed.
 	stream proto.AuthService_StreamSessionRecordingServer
 
 	// serverID is the identity of the server extracted from the x509 certificate.
@@ -88,6 +91,8 @@ type Stream struct {
 	// sessionID is the unique ID of the session.
 	sessionID string
 
+	// reader is a io.Pipe reader over which reads from the tarball are read
+	// by the uploader.
 	reader io.ReadCloser
 
 	// tarWriter is used to create the archive itself.
@@ -99,8 +104,10 @@ type Stream struct {
 	// zipWriter is used to create the zip files within the archive.
 	zipWriter *gzip.Writer
 
+	// uploadContext is used to cancel the tarball upload.
 	uploadContext context.Context
 
+	// uploadCancel is used to cancel the tarball upload.
 	uploadCancel context.CancelFunc
 
 	// waitCh is used to unblock when the upload completes and return
@@ -108,6 +115,8 @@ type Stream struct {
 	waitCh chan error
 }
 
+// NewStreamManger is used to manage common stream resources like a pool of
+// buffers and a semaphore.
 func NewStreamManger(ctx context.Context) *StreamManager {
 	return &StreamManager{
 		log: logrus.WithFields(logrus.Fields{
@@ -123,13 +132,11 @@ func NewStreamManger(ctx context.Context) *StreamManager {
 	}
 }
 
-func (s *StreamManager) NewStream(serverID string, uploader SessionUploader, stream proto.AuthService_StreamSessionRecordingServer) (*Stream, error) {
-	// TODO: This upload context, I need a better story around when it should be
-	// canceled. It should cancel upon any processing error actually.
-
-	// Wrap the parent process context and create an upload context that is
-	// used by the uploader to cancel a upload if one of the events in the
-	// archive is invalid.
+// ProcessStream reads events off a GRPC stream and processes them.
+func (s *StreamManager) ProcessStream(serverID string, uploader SessionUploader, stream proto.AuthService_StreamSessionRecordingServer) (*Stream, error) {
+	// Wrap the parent process shutdown context and create an upload context that is
+	// used by the uploader to cancel a upload if an error occurs while creating
+	// the archive.
 	ctx, cancel := context.WithCancel(s.closeContext)
 
 	st := &Stream{
@@ -171,25 +178,36 @@ func (s *Stream) Wait() error {
 	return <-s.waitCh
 }
 
-func (s *Stream) Close(closeError error) error {
-	//s.uploadCancel()
-
-	success := closeError == nil
+func (s *Stream) Close(err error) {
+	var success bool
 	var message string
-	if closeError != nil {
-		message = closeError.Error()
+
+	// Either the upload is complete (call cancel to free resources) or an error
+	// has occured (terminate upload), either way cancel the context.
+	s.uploadCancel()
+
+	if err != nil {
+		success = false
+		message = err.Error()
+
+		// If the close is occuring due to an error, close the reader so the
+		// io.Copy being done as part of the upload breaks.
+		s.reader.Close()
+	} else {
+		success = true
 	}
 
-	err := s.stream.SendAndClose(&proto.StreamSessionResponse{
+	// Send a response to the client with the result of the stream.
+	err = s.stream.SendAndClose(&proto.StreamSessionResponse{
 		Success: success,
 		Message: message,
 	})
 	if err != nil {
 		s.manager.log.Debugf("Failed to close stream %v: %v.", s.sessionID, err)
-		return trace.Wrap(err)
 	}
 
-	return nil
+	// Unblock the waiter with the result.
+	s.waitCh <- trace.Wrap(err)
 }
 
 func (s *Stream) start() {
@@ -197,11 +215,10 @@ func (s *Stream) start() {
 		// Pull a chunk off the stream.
 		chunk, err := s.stream.Recv()
 		if err == io.EOF {
-			s.waitCh <- nil
 			return
 		}
 		if err != nil {
-			s.waitCh <- trail.ToGRPC(err)
+			s.Close(trail.ToGRPC(err))
 			return
 		}
 
@@ -209,7 +226,7 @@ func (s *Stream) start() {
 		// and send the error to the client.
 		err = s.process(chunk)
 		if err != nil {
-			s.waitCh <- trail.ToGRPC(err)
+			s.Close(trail.ToGRPC(err))
 			return
 		}
 	}
@@ -259,12 +276,7 @@ func (s *Stream) process(chunk *proto.SessionChunk) error {
 		}
 	// Reject all unknown event types.
 	default:
-		err = trace.BadParameter("unknown event type %v", chunk.GetType())
-	}
-
-	// If any error occurs during processing, cancel the upload.
-	if err != nil {
-		s.uploadCancel()
+		return trace.BadParameter("unknown event type %v", chunk.GetType())
 	}
 
 	return nil
@@ -356,10 +368,6 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 		}
 		err := ValidateEvent(f, s.serverID)
 		if err != nil {
-			// Cancel any upload that's in-progress because this event is invalid.
-			s.uploadCancel()
-			s.reader.Close()
-
 			s.manager.log.Warnf("Rejecting audit event %v from %v: %v. A node is attempting to "+
 				"submit events for an identity other than the one on its x509 certificate.",
 				f.GetType(), s.serverID, err)
@@ -412,8 +420,6 @@ func (s *Stream) checkTransition(chunk *proto.SessionChunk) error {
 }
 
 func (s *Stream) upload(namespace string, sessionID session.ID, reader io.Reader) {
-	defer s.uploadCancel()
-
 	err := s.uploader.UploadSessionRecording(SessionRecording{
 		CancelContext: s.uploadContext,
 		SessionID:     sessionID,
@@ -422,9 +428,11 @@ func (s *Stream) upload(namespace string, sessionID session.ID, reader io.Reader
 	})
 	if err != nil {
 		s.manager.log.Warnf("Failed to upload session recording: %v.", err)
-		s.waitCh <- trace.Wrap(err)
+		s.Close(trace.Wrap(err))
 	}
-	s.waitCh <- nil
+
+	// The upload is complete, write nil to unblock.
+	s.Close(nil)
 }
 
 func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) error {
@@ -499,8 +507,6 @@ func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) err
 	if err != nil {
 		return trail.FromGRPC(err)
 	}
-	fmt.Printf("--> Client: Got response: %v: %v.\n", resp.GetSuccess(), resp.GetMessage())
-
 	if resp.GetSuccess() == false {
 		return trace.BadParameter(resp.GetMessage())
 	}
