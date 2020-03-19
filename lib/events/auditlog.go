@@ -324,8 +324,10 @@ func (l *SessionRecording) CheckAndSetDefaults() error {
 	if l.Namespace == "" {
 		l.Namespace = defaults.Namespace
 	}
-
-	// TODO: Make sure if a context has not been set, we create a background context. This is for when old clients talk to new auth servers.
+	// If no cancellation was set (older client) set one that does not expire.
+	if l.CancelContext == nil {
+		l.CancelContext = context.Background()
+	}
 
 	return nil
 }
@@ -342,20 +344,18 @@ func (l *AuditLog) UploadSessionRecording(r SessionRecording) error {
 	if l.UploadHandler == nil {
 		var errs []error
 
+		// Extract the tarball to disk.
 		extractPath := filepath.Join(l.DataDir, l.ServerID, SessionLogsDir, r.Namespace)
 		err := utils.Extract(r.Recording, extractPath)
-		fmt.Printf("--> utils.Extract: %v.\n", err)
 		errs = append(errs, err)
 
 		// If the upload context was canceled, clear out the session recording.
 		select {
 		case <-r.CancelContext.Done():
-			fmt.Printf("--> Context was canceled.\n")
 			err := removeFiles(extractPath, r.SessionID)
 			errs = append(errs, err)
 		default:
 		}
-		fmt.Printf("--> Context not canceled.\n")
 
 		return trace.NewAggregate(errs...)
 	}
@@ -1040,6 +1040,10 @@ func (l *AuditLog) periodicSpaceMonitor() {
 	}
 }
 
+// removeFiles will remove session recordings matching a passed in prefix
+// within the scan dir. Used by both the node (to remove recordings after
+// successfully uploading them) and by auth to remove recordings if the
+// upload context has been canceled.
 func removeFiles(scanDir string, sessionID session.ID) error {
 	df, err := os.Open(scanDir)
 	if err != nil {
