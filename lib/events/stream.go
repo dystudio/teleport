@@ -91,6 +91,9 @@ type Stream struct {
 	// sessionID is the unique ID of the session.
 	sessionID string
 
+	// writer is a io.Pipe writer over which writes to the tarball are done.
+	writer io.WriteCloser
+
 	// reader is a io.Pipe reader over which reads from the tarball are read
 	// by the uploader.
 	reader io.ReadCloser
@@ -251,9 +254,8 @@ func (s *Stream) process(chunk *proto.SessionChunk) error {
 
 		// Create a streaming tar reader/writer to reduce how much of the archive
 		// is buffered in memory.
-		pr, pw := io.Pipe()
-		s.reader = pr
-		s.tarWriter = tar.NewWriter(pw)
+		s.reader, s.writer = io.Pipe()
+		s.tarWriter = tar.NewWriter(s.writer)
 
 		// Kick off the upload in a goroutine so it can be uploaded as it
 		// is processed.
@@ -261,7 +263,14 @@ func (s *Stream) process(chunk *proto.SessionChunk) error {
 	case typeComplete:
 		s.manager.log.Debugf("Changing state to COMPLETE for stream %v.", s.sessionID)
 
+		// Finish the archive by writing the trailer.
 		err = s.tarWriter.Close()
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		// Close the writer to signal that the file is done.
+		err = s.writer.Close()
 		if err != nil {
 			return trace.Wrap(err)
 		}
