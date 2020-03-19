@@ -140,6 +140,11 @@ message SessionChunk {
     bytes Data = 7 [(gogoproto.jsontag) = "payload"];
 }
 
+message StreamSessionResponse {
+    bool Success = 1 [(gogoproto.jsontag) = "success"];
+    string Message = 2 [(gogoproto.jsontag) = "message"];
+}
+
 // AuthService is authentication/authorization service implementation
 service AuthService {
     // SendKeepAlives allows node to send a stream of keep alive requests
@@ -156,7 +161,7 @@ service AuthService {
     rpc GetUsers(GetUsersRequest) returns (stream services.UserV2);
     // StreamSessionRecording allows nodes to stream a session recording to
     // the Auth Server.
-    rpc StreamSessionRecording(stream SessionChunk) returns (google.protobuf.Empty);
+    rpc StreamSessionRecording(stream SessionChunk) returns (StreamSessionResponse);
 }
 
 

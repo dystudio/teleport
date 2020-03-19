@@ -179,32 +179,32 @@ func (u *Uploader) releaseSemaphore() error {
 	}
 }
 
-func (u *Uploader) removeFiles(sessionID session.ID) error {
-	df, err := os.Open(u.scanDir)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	defer df.Close()
-	entries, err := df.Readdir(-1)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	for i := range entries {
-		fi := entries[i]
-		if fi.IsDir() {
-			continue
-		}
-		if !strings.HasPrefix(fi.Name(), string(sessionID)) {
-			continue
-		}
-		path := filepath.Join(u.scanDir, fi.Name())
-		if err := os.Remove(path); err != nil {
-			u.Warningf("Failed to remove %v: %v.", path, trace.DebugReport(err))
-		}
-		u.Debugf("Removed %v.", path)
-	}
-	return nil
-}
+//func (u *Uploader) removeFiles(sessionID session.ID) error {
+//	df, err := os.Open(u.scanDir)
+//	if err != nil {
+//		return trace.ConvertSystemError(err)
+//	}
+//	defer df.Close()
+//	entries, err := df.Readdir(-1)
+//	if err != nil {
+//		return trace.ConvertSystemError(err)
+//	}
+//	for i := range entries {
+//		fi := entries[i]
+//		if fi.IsDir() {
+//			continue
+//		}
+//		if !strings.HasPrefix(fi.Name(), string(sessionID)) {
+//			continue
+//		}
+//		path := filepath.Join(u.scanDir, fi.Name())
+//		if err := os.Remove(path); err != nil {
+//			u.Warningf("Failed to remove %v: %v.", path, trace.DebugReport(err))
+//		}
+//		u.Debugf("Removed %v.", path)
+//	}
+//	return nil
+//}
 
 func (u *Uploader) emitEvent(e UploadEvent) {
 	if u.EventsC == nil {
@@ -245,6 +245,7 @@ func (u *Uploader) uploadFile(lockFilePath string, sessionID session.ID) error {
 			SessionID: sessionID,
 			Recording: reader,
 		})
+		fmt.Printf("--> CLIENT: Upload result: %v.\n", err)
 		if err != nil {
 			u.emitEvent(UploadEvent{
 				SessionID: string(sessionID),
@@ -261,7 +262,7 @@ func (u *Uploader) uploadFile(lockFilePath string, sessionID session.ID) error {
 			u.Warningf("Failed to post upload event: %v. Will retry next time.", trace.DebugReport(err))
 			return
 		}
-		if err := u.removeFiles(sessionID); err != nil {
+		if err := removeFiles(u.scanDir, sessionID); err != nil {
 			u.Warningf("Failed to remove files: %v.", err)
 		}
 	}()

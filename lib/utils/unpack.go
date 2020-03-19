@@ -18,7 +18,6 @@ package utils
 
 import (
 	"archive/tar"
-	"fmt"
 	"io"
 	"strings"
 
@@ -52,7 +51,6 @@ func Extract(r io.Reader, dir string) error {
 		}
 
 		if err := extractFile(tarball, header, dir); err != nil {
-			fmt.Printf("--> extractFile: %v.\n", err)
 			return trace.Wrap(err)
 		}
 	}

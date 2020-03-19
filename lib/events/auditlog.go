@@ -340,14 +340,29 @@ func (l *AuditLog) UploadSessionRecording(r SessionRecording) error {
 	// This function runs on the Auth Server. If no upload handler is defined
 	// (for example, not going to S3) then unarchive it to Auth Server disk.
 	if l.UploadHandler == nil {
-		err := utils.Extract(r.Recording, filepath.Join(l.DataDir, l.ServerID, SessionLogsDir, r.Namespace))
-		//fmt.Printf("--> AuditLog UploadSessionRecording: %v.\n", err)
-		return trace.Wrap(err)
+		var errs []error
+
+		extractPath := filepath.Join(l.DataDir, l.ServerID, SessionLogsDir, r.Namespace)
+		err := utils.Extract(r.Recording, extractPath)
+		fmt.Printf("--> utils.Extract: %v.\n", err)
+		errs = append(errs, err)
+
+		// If the upload context was canceled, clear out the session recording.
+		select {
+		case <-r.CancelContext.Done():
+			fmt.Printf("--> Context was canceled.\n")
+			err := removeFiles(extractPath, r.SessionID)
+			errs = append(errs, err)
+		default:
+		}
+		fmt.Printf("--> Context not canceled.\n")
+
+		return trace.NewAggregate(errs...)
 	}
 
 	// Upload session recording to endpoint defined in file configuration. Like S3.
 	start := time.Now()
-	url, err := l.UploadHandler.Upload(context.TODO(), r.SessionID, r.Recording)
+	url, err := l.UploadHandler.Upload(r.CancelContext, r.SessionID, r.Recording)
 	if err != nil {
 		l.WithFields(log.Fields{"duration": time.Now().Sub(start), "session-id": r.SessionID}).Warningf("Session upload failed: %v", trace.DebugReport(err))
 		return trace.Wrap(err)
@@ -1023,4 +1038,31 @@ func (l *AuditLog) periodicSpaceMonitor() {
 			return
 		}
 	}
+}
+
+func removeFiles(scanDir string, sessionID session.ID) error {
+	df, err := os.Open(scanDir)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	defer df.Close()
+	entries, err := df.Readdir(-1)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	for i := range entries {
+		fi := entries[i]
+		if fi.IsDir() {
+			continue
+		}
+		if !strings.HasPrefix(fi.Name(), string(sessionID)) {
+			continue
+		}
+		path := filepath.Join(scanDir, fi.Name())
+		if err := os.Remove(path); err != nil {
+			log.Warningf("Failed to remove %v: %v.", path, trace.DebugReport(err))
+		}
+		log.Debugf("Removed %v.", path)
+	}
+	return nil
 }

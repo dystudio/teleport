@@ -80,11 +80,15 @@ type Stream struct {
 	state    int64
 	uploader SessionUploader
 
+	stream proto.AuthService_StreamSessionRecordingServer
+
 	// serverID is the identity of the server extracted from the x509 certificate.
 	serverID string
 
 	// sessionID is the unique ID of the session.
 	sessionID string
+
+	reader io.ReadCloser
 
 	// tarWriter is used to create the archive itself.
 	tarWriter *tar.Writer
@@ -119,7 +123,7 @@ func NewStreamManger(ctx context.Context) *StreamManager {
 	}
 }
 
-func (s *StreamManager) NewStream(serverID string, uploader SessionUploader) (*Stream, error) {
+func (s *StreamManager) NewStream(serverID string, uploader SessionUploader, stream proto.AuthService_StreamSessionRecordingServer) (*Stream, error) {
 	// TODO: This upload context, I need a better story around when it should be
 	// canceled. It should cancel upon any processing error actually.
 
@@ -128,15 +132,21 @@ func (s *StreamManager) NewStream(serverID string, uploader SessionUploader) (*S
 	// archive is invalid.
 	ctx, cancel := context.WithCancel(s.closeContext)
 
-	return &Stream{
+	st := &Stream{
 		manager:       s,
+		stream:        stream,
 		state:         stateInit,
 		uploader:      uploader,
 		serverID:      serverID,
 		uploadContext: ctx,
 		uploadCancel:  cancel,
 		waitCh:        make(chan error),
-	}, nil
+	}
+
+	// Start reading off the stream and processing events.
+	go st.start()
+
+	return st, nil
 }
 
 func (s *StreamManager) takeSemaphore() error {
@@ -161,6 +171,27 @@ func (s *Stream) Wait() error {
 	return <-s.waitCh
 }
 
+func (s *Stream) Close(closeError error) error {
+	//s.uploadCancel()
+
+	success := closeError == nil
+	var message string
+	if closeError != nil {
+		message = closeError.Error()
+	}
+
+	err := s.stream.SendAndClose(&proto.StreamSessionResponse{
+		Success: success,
+		Message: message,
+	})
+	if err != nil {
+		s.manager.log.Debugf("Failed to close stream %v: %v.", s.sessionID, err)
+		return trace.Wrap(err)
+	}
+
+	return nil
+}
+
 func (s *Stream) GetState() int64 {
 	return atomic.LoadInt64(&s.state)
 }
@@ -169,11 +200,33 @@ func (s *Stream) setState(state int64) {
 	atomic.StoreInt64(&s.state, state)
 }
 
-func (s *Stream) Process(chunk *proto.SessionChunk) error {
+func (s *Stream) start() {
+	for {
+		// Pull a chunk off the stream.
+		chunk, err := s.stream.Recv()
+		if err == io.EOF {
+			s.waitCh <- nil
+			return
+		}
+		if err != nil {
+			s.waitCh <- trail.ToGRPC(err)
+			return
+		}
+
+		// Process chunk. If an error occurs, the server will close the stream
+		// and send the error to the client.
+		err = s.process(chunk)
+		if err != nil {
+			s.waitCh <- trail.ToGRPC(err)
+			return
+		}
+	}
+}
+
+func (s *Stream) process(chunk *proto.SessionChunk) error {
 	// Check that the state transitions are sane.
 	err := s.checkTransition(chunk)
 	if err != nil {
-		fmt.Printf("--> INVALID STATE.\n")
 		return trace.Wrap(err)
 	}
 	s.setState(chunk.GetState())
@@ -186,11 +239,12 @@ func (s *Stream) Process(chunk *proto.SessionChunk) error {
 		// Create a streaming tar reader/writer to reduce how much of the archive
 		// is buffered in memory.
 		pr, pw := io.Pipe()
+		s.reader = pr
 		s.tarWriter = tar.NewWriter(pw)
 
 		// Kick off the upload in a goroutine so it can be uploaded as it
 		// is processed.
-		go s.upload(chunk.GetNamespace(), session.ID(chunk.GetSessionID()), pr)
+		go s.upload(chunk.GetNamespace(), session.ID(chunk.GetSessionID()), s.reader)
 	case stateComplete:
 		s.manager.log.Debugf("Changing state to COMPLETE for stream %v.", s.sessionID)
 
@@ -312,6 +366,7 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 		if err != nil {
 			// Cancel any upload that's in-progress because this event is invalid.
 			s.uploadCancel()
+			s.reader.Close()
 
 			s.manager.log.Warnf("Rejecting audit event %v from %v: %v. A node is attempting to "+
 				"submit events for an identity other than the one on its x509 certificate.",
@@ -362,15 +417,6 @@ func (s *Stream) checkTransition(chunk *proto.SessionChunk) error {
 	}
 
 	return trace.BadParameter("invalid chunk transition from %v to %v", prev, chunk.GetState())
-}
-
-func (s *Stream) Reader() io.Reader {
-	return nil
-}
-
-func (s *Stream) Close() error {
-	s.uploadCancel()
-	return nil
 }
 
 func (s *Stream) upload(namespace string, sessionID session.ID, reader io.Reader) {
@@ -454,11 +500,19 @@ func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) err
 		return trace.Wrap(err)
 	}
 
-	// All done, send a complete message and close the stream.
-	err = stream.CloseSend()
+	// Close the stream and get response. An error is returned if a problem
+	// occured trying to construct the tar archive or if an invalid event
+	// was sent.
+	resp, err := stream.CloseAndRecv()
 	if err != nil {
 		return trail.FromGRPC(err)
 	}
+	fmt.Printf("--> Client: Got response: %v: %v.\n", resp.GetSuccess(), resp.GetMessage())
+
+	if resp.GetSuccess() == false {
+		return trace.BadParameter(resp.GetMessage())
+	}
+
 	return nil
 }
 
@@ -553,6 +607,16 @@ func sendEventChunks(stream proto.AuthService_StreamSessionRecordingClient, read
 			State: stateChunkEvents,
 			Data:  scanner.Bytes(),
 		})
+		if err != nil {
+			return trail.FromGRPC(err)
+		}
+		err = stream.Send(&proto.SessionChunk{
+			State: stateChunkEvents,
+			Data:  []byte(`{"server_id": "123"}`),
+		})
+		if err != nil {
+			return trail.FromGRPC(err)
+		}
 	}
 	err = scanner.Err()
 	if err != nil {

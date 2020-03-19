@@ -18,7 +18,6 @@ package auth
 
 import (
 	"context"
-	//"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -192,8 +191,7 @@ func (g *GRPCServer) GetUsers(req *proto.GetUsersRequest, stream proto.AuthServi
 	return nil
 }
 
-func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessionRecordingServer) error {
-	defer stream.SendAndClose(&empty.Empty{})
+func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessionRecordingServer) (er error) {
 	auth, err := g.authenticate(stream.Context())
 	if err != nil {
 		return trail.ToGRPC(err)
@@ -205,34 +203,14 @@ func (g *GRPCServer) StreamSessionRecording(stream proto.AuthService_StreamSessi
 		return trace.Wrap(err)
 	}
 
-	// Create a stream building state machine. This state machine will validate
-	// session events, construct the session archive, and upload it to the
-	// storage layer.
-	sb, err := g.manager.NewStream(serverID, auth)
+	// Create a new stream and process events in a non-blocking manner.
+	sb, err := g.manager.NewStream(serverID, auth, stream)
 	if err != nil {
 		return trail.ToGRPC(err)
 	}
-	defer sb.Close()
+	defer sb.Close(trace.Wrap(er))
 
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return trail.ToGRPC(err)
-		}
-
-		// Send the stream chunk to the state machine to be processed.
-		err = sb.Process(chunk)
-		if err != nil {
-			return trail.ToGRPC(err)
-		}
-
-	}
-
-	// Wait for the upload to finish in-case an error occurs uploading the
-	// last chunk.
+	// Wait will block until the stream is complete or an error occurs.
 	err = sb.Wait()
 	if err != nil {
 		return trace.Wrap(err)
