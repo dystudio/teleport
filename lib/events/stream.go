@@ -26,7 +26,7 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"sync/atomic"
+	//"sync/atomic"
 
 	"github.com/gravitational/teleport/lib/auth/proto"
 	"github.com/gravitational/teleport/lib/session"
@@ -39,17 +39,17 @@ import (
 )
 
 const (
-	stateInit = 0
+	typeInit = 0
 
-	stateOpenRaw  = 1
-	stateChunkRaw = 2
-	stateCloseRaw = 3
+	typeOpenRaw  = 1
+	typeChunkRaw = 2
+	typeCloseRaw = 3
 
-	stateOpenEvents  = 4
-	stateChunkEvents = 5
-	stateCloseEvents = 6
+	typeOpenEvents  = 4
+	typeChunkEvents = 5
+	typeCloseEvents = 6
 
-	stateComplete = 7
+	typeComplete = 7
 )
 
 const (
@@ -76,9 +76,9 @@ type StreamManager struct {
 }
 
 type Stream struct {
-	manager  *StreamManager
-	state    int64
-	uploader SessionUploader
+	manager   *StreamManager
+	chunkType int64
+	uploader  SessionUploader
 
 	stream proto.AuthService_StreamSessionRecordingServer
 
@@ -135,7 +135,7 @@ func (s *StreamManager) NewStream(serverID string, uploader SessionUploader, str
 	st := &Stream{
 		manager:       s,
 		stream:        stream,
-		state:         stateInit,
+		chunkType:     typeInit,
 		uploader:      uploader,
 		serverID:      serverID,
 		uploadContext: ctx,
@@ -192,14 +192,6 @@ func (s *Stream) Close(closeError error) error {
 	return nil
 }
 
-func (s *Stream) GetState() int64 {
-	return atomic.LoadInt64(&s.state)
-}
-
-func (s *Stream) setState(state int64) {
-	atomic.StoreInt64(&s.state, state)
-}
-
 func (s *Stream) start() {
 	for {
 		// Pull a chunk off the stream.
@@ -224,15 +216,15 @@ func (s *Stream) start() {
 }
 
 func (s *Stream) process(chunk *proto.SessionChunk) error {
-	// Check that the state transitions are sane.
+	// Check that the chunk transitions are sane.
 	err := s.checkTransition(chunk)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	s.setState(chunk.GetState())
+	s.chunkType = chunk.GetType()
 
-	switch chunk.GetState() {
-	case stateInit:
+	switch chunk.GetType() {
+	case typeInit:
 		s.sessionID = chunk.GetSessionID()
 		s.manager.log.Debugf("Changing state to INIT for stream %v.", s.sessionID)
 
@@ -245,7 +237,7 @@ func (s *Stream) process(chunk *proto.SessionChunk) error {
 		// Kick off the upload in a goroutine so it can be uploaded as it
 		// is processed.
 		go s.upload(chunk.GetNamespace(), session.ID(chunk.GetSessionID()), s.reader)
-	case stateComplete:
+	case typeComplete:
 		s.manager.log.Debugf("Changing state to COMPLETE for stream %v.", s.sessionID)
 
 		err = s.tarWriter.Close()
@@ -253,21 +245,21 @@ func (s *Stream) process(chunk *proto.SessionChunk) error {
 			return trace.Wrap(err)
 		}
 	// Raw events are directly streamed into the tar archive.
-	case stateOpenRaw, stateCloseRaw, stateChunkRaw:
+	case typeOpenRaw, typeCloseRaw, typeChunkRaw:
 		err = s.processRaw(chunk)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 	// Events are aggregated into a gzip archive in memory first, then streamed
 	// to the tar archive.
-	case stateOpenEvents, stateCloseEvents, stateChunkEvents:
+	case typeOpenEvents, typeCloseEvents, typeChunkEvents:
 		err = s.processEvents(chunk)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 	// Reject all unknown event types.
 	default:
-		err = trace.BadParameter("unknown event type %v", chunk.GetState())
+		err = trace.BadParameter("unknown event type %v", chunk.GetType())
 	}
 
 	// If any error occurs during processing, cancel the upload.
@@ -282,14 +274,14 @@ func (s *Stream) process(chunk *proto.SessionChunk) error {
 func (s *Stream) processRaw(chunk *proto.SessionChunk) error {
 	var err error
 
-	switch chunk.GetState() {
+	switch chunk.GetType() {
 	// Open the tar archive by writing the header. Since this is a raw stream
 	// the size of the content to be written is known.
-	case stateOpenRaw:
+	case typeOpenRaw:
 		s.manager.log.Debugf("Changing state to OPEN RAW for stream %v.", s.sessionID)
 
 		err := s.tarWriter.WriteHeader(&tar.Header{
-			Name: chunk.GetName(),
+			Name: chunk.GetFileName(),
 			Mode: 0600,
 			Size: chunk.GetFileSize(),
 		})
@@ -298,10 +290,10 @@ func (s *Stream) processRaw(chunk *proto.SessionChunk) error {
 		}
 	// Close is a NOP because writing a header indicates the size of file and
 	// where the next file starts.
-	case stateCloseRaw:
+	case typeCloseRaw:
 		s.manager.log.Debugf("Changing state to CLOSE RAW for stream %v.", s.sessionID)
 	// Chunk can be written directly to the tar archive.
-	case stateChunkRaw:
+	case typeChunkRaw:
 		s.manager.log.Debugf("Changing state to CHUNK RAW for stream %v.", s.sessionID)
 
 		_, err = s.tarWriter.Write(chunk.GetData())
@@ -317,8 +309,8 @@ func (s *Stream) processRaw(chunk *proto.SessionChunk) error {
 func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 	var err error
 
-	switch chunk.GetState() {
-	case stateOpenEvents:
+	switch chunk.GetType() {
+	case typeOpenEvents:
 		s.manager.log.Debugf("Changing state to OPEN EVENTS for stream %v.", s.sessionID)
 
 		// Get a buffer from the pool.
@@ -328,7 +320,7 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 		if err != nil {
 			return trace.Wrap(err)
 		}
-	case stateCloseEvents:
+	case typeCloseEvents:
 		s.manager.log.Debugf("Changing state to CLOSE EVENTS for stream %v.", s.sessionID)
 
 		// Close zip file and after writing it to the tar archive, release
@@ -342,7 +334,7 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 
 		// Copy the zip archive into the tar stream.
 		err := s.tarWriter.WriteHeader(&tar.Header{
-			Name: chunk.GetName(),
+			Name: chunk.GetFileName(),
 			Mode: 0600,
 			Size: int64(s.zipBuffer.Len()),
 		})
@@ -353,7 +345,7 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 		if err != nil {
 			return trace.Wrap(err)
 		}
-	case stateChunkEvents:
+	case typeChunkEvents:
 		s.manager.log.Debugf("Changing state to CHUNK EVENTS for stream %v.", s.sessionID)
 
 		// Validate incoming event.
@@ -385,38 +377,38 @@ func (s *Stream) processEvents(chunk *proto.SessionChunk) error {
 
 // checkTransition makes sure the archive is being created in a sane manner.
 func (s *Stream) checkTransition(chunk *proto.SessionChunk) error {
-	prev := s.GetState()
+	prev := s.chunkType
 
-	switch chunk.GetState() {
-	case stateInit:
+	switch chunk.GetType() {
+	case typeInit:
 		return nil
-	case stateOpenRaw, stateOpenEvents:
-		if prev == stateInit || prev == stateCloseRaw || prev == stateCloseEvents {
+	case typeOpenRaw, typeOpenEvents:
+		if prev == typeInit || prev == typeCloseRaw || prev == typeCloseEvents {
 			return nil
 		}
-	case stateChunkRaw:
-		if prev == stateChunkRaw || prev == stateOpenRaw {
+	case typeChunkRaw:
+		if prev == typeChunkRaw || prev == typeOpenRaw {
 			return nil
 		}
-	case stateCloseRaw:
-		if prev == stateChunkRaw {
+	case typeCloseRaw:
+		if prev == typeChunkRaw {
 			return nil
 		}
-	case stateChunkEvents:
-		if prev == stateChunkEvents || prev == stateOpenEvents {
+	case typeChunkEvents:
+		if prev == typeChunkEvents || prev == typeOpenEvents {
 			return nil
 		}
-	case stateCloseEvents:
-		if prev == stateChunkEvents {
+	case typeCloseEvents:
+		if prev == typeChunkEvents {
 			return nil
 		}
-	case stateComplete:
-		if prev == stateCloseRaw || prev == stateCloseEvents {
+	case typeComplete:
+		if prev == typeCloseRaw || prev == typeCloseEvents {
 			return nil
 		}
 	}
 
-	return trace.BadParameter("invalid chunk transition from %v to %v", prev, chunk.GetState())
+	return trace.BadParameter("invalid chunk transition from %v to %v", prev, chunk.GetType())
 }
 
 func (s *Stream) upload(namespace string, sessionID session.ID, reader io.Reader) {
@@ -444,7 +436,7 @@ func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) err
 
 	// Initialize stream.
 	err = stream.Send(&proto.SessionChunk{
-		State:     stateInit,
+		Type:      typeInit,
 		Namespace: r.Namespace,
 		SessionID: r.SessionID.String(),
 	})
@@ -494,7 +486,7 @@ func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) err
 
 	// Send complete event.
 	err = stream.Send(&proto.SessionChunk{
-		State: stateComplete,
+		Type: typeComplete,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -518,14 +510,14 @@ func StreamSessionRecording(clt proto.AuthServiceClient, r SessionRecording) err
 
 // sendOpenEvent sends either a stateOpenRaw or stateOpenEvents chunk.
 func sendOpenEvent(stream proto.AuthService_StreamSessionRecordingClient, header *tar.Header, isEvents bool) error {
-	chunkState := stateOpenRaw
+	chunkType := typeOpenRaw
 	if isEvents {
-		chunkState = stateOpenEvents
+		chunkType = typeOpenEvents
 	}
 
 	err := stream.Send(&proto.SessionChunk{
-		State:    int64(chunkState),
-		Name:     header.Name,
+		Type:     int64(chunkType),
+		FileName: header.Name,
 		FileSize: header.Size,
 	})
 	if err != nil {
@@ -537,14 +529,14 @@ func sendOpenEvent(stream proto.AuthService_StreamSessionRecordingClient, header
 
 // sendCloseEvent sends either a stateCloseRaw or stateCloseEvents chunk.
 func sendCloseEvent(stream proto.AuthService_StreamSessionRecordingClient, header *tar.Header, isEvents bool) error {
-	chunkState := stateCloseRaw
+	chunkType := typeCloseRaw
 	if isEvents {
-		chunkState = stateCloseEvents
+		chunkType = typeCloseEvents
 	}
 
 	err := stream.Send(&proto.SessionChunk{
-		State:    int64(chunkState),
-		Name:     header.Name,
+		Type:     int64(chunkType),
+		FileName: header.Name,
 		FileSize: header.Size,
 	})
 	if err != nil {
@@ -572,8 +564,8 @@ func sendRawChunks(stream proto.AuthService_StreamSessionRecordingClient, reader
 		// Send raw file chunk.
 		if len(data) > 0 {
 			err = stream.Send(&proto.SessionChunk{
-				State: stateChunkRaw,
-				Data:  data[:n],
+				Type: typeChunkRaw,
+				Data: data[:n],
 			})
 			if err != nil {
 				return trace.Wrap(err)
@@ -604,19 +596,19 @@ func sendEventChunks(stream proto.AuthService_StreamSessionRecordingClient, read
 	for scanner.Scan() {
 		// Send event chunk.
 		err = stream.Send(&proto.SessionChunk{
-			State: stateChunkEvents,
-			Data:  scanner.Bytes(),
+			Type: typeChunkEvents,
+			Data: scanner.Bytes(),
 		})
 		if err != nil {
 			return trail.FromGRPC(err)
 		}
-		err = stream.Send(&proto.SessionChunk{
-			State: stateChunkEvents,
-			Data:  []byte(`{"server_id": "123"}`),
-		})
-		if err != nil {
-			return trail.FromGRPC(err)
-		}
+		//err = stream.Send(&proto.SessionChunk{
+		//	Type: typeChunkEvents,
+		//	Data: []byte(`{"server_id": "123"}`),
+		//})
+		//if err != nil {
+		//	return trail.FromGRPC(err)
+		//}
 	}
 	err = scanner.Err()
 	if err != nil {
